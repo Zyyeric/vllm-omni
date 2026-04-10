@@ -31,9 +31,15 @@ logger = init_logger(__name__)
 
 # Small helper to centralize cache-dit summaries.
 def cache_summary(pipeline: Any, details: bool = True) -> None:
-    cache_dit.summary(pipeline.transformer, details=details)
+    if hasattr(pipeline, "transformer"):
+        cache_dit.summary(pipeline.transformer, details=details)
+    elif hasattr(pipeline, "dit"):
+        cache_dit.summary(getattr(pipeline.dit, "block", pipeline.dit), details=details)
+
     if hasattr(pipeline, "transformer_2"):
         cache_dit.summary(pipeline.transformer_2, details=details)
+    if hasattr(pipeline, "sr_dit"):
+        cache_dit.summary(getattr(pipeline.sr_dit, "block", pipeline.sr_dit), details=details)
 
 
 # Registry of custom cache-dit enablers for specific models
@@ -719,6 +725,96 @@ def enable_cache_for_hunyuan_image3(pipeline: Any, cache_config: Any) -> Callabl
     return refresh_cache_context
 
 
+def enable_cache_for_magihuman(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for MagiHuman pipeline.
+
+    MagiHuman uses separate base-resolution and super-resolution DiT models at
+    ``pipeline.dit`` and ``pipeline.sr_dit``. Each DiT runs an inner
+    ``TransformerBlock`` at ``dit.block`` with mutable layers in ``block.layers``.
+    """
+    db_cache_config = _build_db_cache_config(cache_config)
+
+    calibrator_config = None
+    if cache_config.enable_taylorseer:
+        taylorseer_order = cache_config.taylorseer_order
+        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
+
+    transformers = []
+    blocks = []
+    for attr_name in ("dit", "sr_dit"):
+        dit = getattr(pipeline, attr_name, None)
+        transformer = getattr(dit, "block", None)
+        if transformer is None or not hasattr(transformer, "layers"):
+            raise ValueError(
+                f"MagiHuman cache-dit enabler expects pipeline.{attr_name}.block.layers, "
+                f"got pipeline={pipeline.__class__.__name__}"
+            )
+        transformers.append(transformer)
+        blocks.append(transformer.layers)
+
+    logger.info(
+        f"Enabling cache-dit on MagiHuman DiT models: "
+        f"Fn={db_cache_config.Fn_compute_blocks}, "
+        f"Bn={db_cache_config.Bn_compute_blocks}, "
+        f"W={db_cache_config.max_warmup_steps}, "
+    )
+
+    modifiers = [
+        ParamsModifier(
+            cache_config=db_cache_config,
+            calibrator_config=calibrator_config,
+        )
+        for _ in transformers
+    ]
+
+    cache_dit.enable_cache(
+        BlockAdapter(
+            transformer=transformers,
+            blocks=blocks,
+            blocks_name=["layers" for _ in transformers],
+            # MagiHuman TransFormerLayer.forward(hidden_states, ...) returns hidden_states.
+            forward_pattern=[ForwardPattern.Pattern_3 for _ in transformers],
+            params_modifiers=modifiers,
+            check_forward_pattern=False,
+        ),
+        cache_config=db_cache_config,
+        calibrator_config=calibrator_config,
+    )
+
+    def refresh_transformer(transformer: Any, num_steps: int, verbose: bool) -> None:
+        if cache_config.scm_steps_mask_policy is None:
+            cache_dit.refresh_context(transformer, num_inference_steps=num_steps, verbose=verbose)
+        else:
+            cache_dit.refresh_context(
+                transformer,
+                cache_config=DBCacheConfig().reset(
+                    num_inference_steps=num_steps,
+                    steps_computation_mask=cache_dit.steps_mask(
+                        mask_policy=cache_config.scm_steps_mask_policy,
+                        total_steps=num_steps,
+                    ),
+                    steps_computation_policy=cache_config.scm_steps_policy,
+                ),
+                verbose=verbose,
+            )
+
+    def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
+        transformer = getattr(getattr(pipeline, "dit", None), "block", None)
+        if transformer is None:
+            raise ValueError("MagiHuman cache-dit refresh expects pipeline.dit.block to exist.")
+        refresh_transformer(transformer, num_inference_steps, verbose)
+
+        sr_transformer = getattr(getattr(pipeline, "sr_dit", None), "block", None)
+        if sr_transformer is None:
+            raise ValueError("MagiHuman cache-dit refresh expects pipeline.sr_dit.block to exist.")
+
+        sr_num_inference_steps = getattr(pipeline, "sr_num_inference_steps_default", num_inference_steps)
+        refresh_transformer(sr_transformer, sr_num_inference_steps, verbose)
+
+    return refresh_cache_context
+
+
 class BagelCachedContextManager(CachedContextManager):
     """
     Custom CachedContextManager for Bagel that safely handles NaiveCache objects
@@ -1208,6 +1304,7 @@ CUSTOM_DIT_ENABLERS.update(
         "Wan22I2VPipeline": enable_cache_for_wan22,
         "Wan22TI2VPipeline": enable_cache_for_wan22,
         "HunyuanImage3Pipeline": enable_cache_for_hunyuan_image3,
+        "MagiHumanPipeline": enable_cache_for_magihuman,
         "FluxPipeline": enable_cache_for_flux,
         "Flux2KleinPipeline": enable_cache_for_flux2_klein,
         "LongCatImagePipeline": enable_cache_for_longcat_image,

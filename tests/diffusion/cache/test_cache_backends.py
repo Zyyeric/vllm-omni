@@ -127,6 +127,10 @@ class TestCacheDiTBackend:
         """Test HunyuanImage3 custom cache-dit enabler is registered."""
         assert "HunyuanImage3Pipeline" in CUSTOM_DIT_ENABLERS
 
+    def test_magihuman_custom_enabler_registered(self):
+        """Test MagiHuman custom cache-dit enabler is registered."""
+        assert "MagiHumanPipeline" in CUSTOM_DIT_ENABLERS
+
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
     @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
     def test_enable_hunyuan_pipeline_uses_model_transformer(self, mock_cache_dit, mock_block_adapter):
@@ -167,6 +171,65 @@ class TestCacheDiTBackend:
         backend = CacheDiTBackend({"Fn_compute_blocks": 2})
 
         with pytest.raises(ValueError, match="HunyuanImage3Pipeline"):
+            backend.enable(mock_pipeline)
+
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.BlockAdapter")
+    @patch("vllm_omni.diffusion.cache.cache_dit_backend.cache_dit")
+    def test_enable_magihuman_pipeline_uses_dit_transformers(self, mock_cache_dit, mock_block_adapter):
+        """Test MagiHuman custom enabler uses both DiT models with Pattern_3 adapters."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MagiHumanPipeline"
+        mock_pipeline.dit = Mock()
+        mock_pipeline.dit.block = Mock()
+        mock_pipeline.dit.block.layers = Mock()
+        mock_pipeline.sr_dit = Mock()
+        mock_pipeline.sr_dit.block = Mock()
+        mock_pipeline.sr_dit.block.layers = Mock()
+        mock_pipeline.sr_num_inference_steps_default = 5
+
+        mock_cache_dit.enable_cache = Mock()
+        mock_cache_dit.refresh_context = Mock()
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+        backend.enable(mock_pipeline)
+
+        assert backend.enabled is True
+        assert backend._refresh_func is not None
+        mock_block_adapter.assert_called_once()
+        adapter_kwargs = mock_block_adapter.call_args.kwargs
+        assert adapter_kwargs["transformer"][0] is mock_pipeline.dit.block
+        assert adapter_kwargs["transformer"][1] is mock_pipeline.sr_dit.block
+        assert adapter_kwargs["blocks"][0] is mock_pipeline.dit.block.layers
+        assert adapter_kwargs["blocks"][1] is mock_pipeline.sr_dit.block.layers
+        assert adapter_kwargs["blocks_name"] == ["layers", "layers"]
+        assert adapter_kwargs["forward_pattern"] == [
+            adapter_kwargs["forward_pattern"][0].__class__.Pattern_3,
+            adapter_kwargs["forward_pattern"][1].__class__.Pattern_3,
+        ]
+        assert len(adapter_kwargs["params_modifiers"]) == 2
+        assert adapter_kwargs["check_forward_pattern"] is False
+        mock_cache_dit.enable_cache.assert_called_once()
+
+        backend.refresh(mock_pipeline, num_inference_steps=12)
+        assert mock_cache_dit.refresh_context.call_count == 2
+        dit_call, sr_dit_call = mock_cache_dit.refresh_context.call_args_list
+        assert dit_call.args[0] is mock_pipeline.dit.block
+        assert dit_call.kwargs["num_inference_steps"] == 12
+        assert sr_dit_call.args[0] is mock_pipeline.sr_dit.block
+        assert sr_dit_call.kwargs["num_inference_steps"] == 5
+
+    def test_enable_magihuman_pipeline_requires_dit_block_layers(self):
+        """Test MagiHuman enabler fails with a formatted pipeline class name."""
+        mock_pipeline = Mock()
+        mock_pipeline.__class__.__name__ = "MagiHumanPipeline"
+        mock_pipeline.dit = Mock(spec=[])
+        mock_pipeline.sr_dit = Mock()
+        mock_pipeline.sr_dit.block = Mock()
+        mock_pipeline.sr_dit.block.layers = Mock()
+
+        backend = CacheDiTBackend({"Fn_compute_blocks": 2})
+
+        with pytest.raises(ValueError, match="MagiHumanPipeline"):
             backend.enable(mock_pipeline)
 
 
